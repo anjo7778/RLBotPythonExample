@@ -6,7 +6,7 @@ from rlbot.messages.flat.QuickChatSelection import QuickChatSelection
 from rlbot.utils.structures.ball_prediction_struct import BallPrediction, Slice
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 
-from util.boost_pad_tracker import BoostPadTracker
+from util.boost_pad_tracker import BoostPadTracker, BoostPad
 from util.drive import steer_toward_target
 from util.orientation import Orientation, relative_location
 from util.sequence import Sequence, ControlStep
@@ -45,9 +45,16 @@ class MyBot(BaseAgent):
         car_location = Vec3(my_car.physics.location)
         car_velocity = Vec3(my_car.physics.velocity)
         ball_location = Vec3(packet.game_ball.physics.location)
+        ball_velocity = Vec3(packet.game_ball.physics.velocity)
         car_orientation = Orientation(my_car.physics.rotation)
 
         controls = SimpleControllerState()
+
+        if not my_car.has_wheel_contact and car_location.z < 200:
+            controls.roll = -car_orientation.right.z
+            controls.pitch = -car_orientation.forward.z
+            controls.throttle = 0.5
+            return controls
 
         # Handle kickoffs with a strong dash toward the ball.
         if self.is_kickoff(packet):
@@ -66,12 +73,26 @@ class MyBot(BaseAgent):
         # Approach from behind the ball relative to the opponent's goal like Nexto.
         opponent_goal_y = 5120 if self.team == 0 else -5120
         opponent_goal = Vec3(0, opponent_goal_y, 0)
-        approach_direction = (opponent_goal - target_position).flat()
+        own_goal = Vec3(0, -opponent_goal_y, 0)
+        shadow_target = self.choose_shadow_position(ball_location, ball_velocity, own_goal)
+        if shadow_target is not None:
+            target_position = shadow_target
+
+        approach_goal = opponent_goal if shadow_target is None else own_goal
+        approach_direction = (approach_goal - target_position).flat()
         if approach_direction.length() < 1:
             approach_direction = Vec3(0, 1 if opponent_goal_y > 0 else -1, 0)
         offset_distance = 320 if target_slice and target_slice.physics.location.z < 150 else 240
         target_location = target_position - approach_direction.rescale(offset_distance)
         target_location.z = max(0, target_location.z)
+
+        chosen_boost = None
+        if my_car.boost < 25 and not self.is_kickoff(packet):
+            chosen_boost = self.choose_best_boost(car_location, target_location, ball_location, own_goal)
+            if chosen_boost is not None:
+                target_location = chosen_boost.location
+                target_slice = None
+                time_remaining = None
 
         # Visualize our intent.
         self.renderer.draw_line_3d(car_location, target_location, self.renderer.white())
@@ -106,6 +127,47 @@ class MyBot(BaseAgent):
             controls.pitch = -0.15
 
         return controls
+
+    def choose_shadow_position(self, ball_location: Vec3, ball_velocity: Vec3, own_goal: Vec3) -> Optional[Vec3]:
+        ball_moving_toward_goal = (own_goal.y - ball_location.y) * ball_velocity.y > 0 and abs(ball_velocity.y) > 150
+        if not ball_moving_toward_goal:
+            return None
+
+        ball_distance_from_goal = ball_location.flat().dist(own_goal.flat())
+        if ball_distance_from_goal > 3800:
+            return None
+
+        goal_to_ball = (ball_location - own_goal).flat()
+        if goal_to_ball.length() < 1:
+            return None
+
+        shadow_distance = max(650, min(1200, ball_distance_from_goal * 0.45))
+        shadow_direction = goal_to_ball.rescale(1)
+        target = ball_location - shadow_direction.rescale(shadow_distance)
+        target.z = 0
+        return target
+
+    def choose_best_boost(self, car_location: Vec3, current_target: Vec3, ball_location: Vec3, own_goal: Vec3) -> Optional[BoostPad]:
+        critical_defense = ball_location.flat().dist(own_goal.flat()) < 1800
+        best_pad: Optional[BoostPad] = None
+        best_score = None
+        for pad in self.boost_pad_tracker.get_full_boosts():
+            if not pad.is_active:
+                continue
+
+            pad_distance = car_location.flat().dist(pad.location.flat())
+            if pad_distance > 5000:
+                continue
+
+            if critical_defense and pad_distance > 1200:
+                continue
+
+            detour_score = pad_distance + pad.location.flat().dist(current_target.flat()) * 0.35
+            if best_score is None or detour_score < best_score:
+                best_score = detour_score
+                best_pad = pad
+
+        return best_pad
 
     def begin_front_flip(self, packet):
         # Send some quickchat just for fun
