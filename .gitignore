@@ -1,6 +1,3 @@
-# Necto shit
-training/training
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -113,4 +110,3 @@ ENV/
 # VSCode
 .vscode/
 *.code-workspace
-/src-alt/
