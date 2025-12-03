@@ -1,10 +1,12 @@
+import math
+
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.messages.flat.QuickChatSelection import QuickChatSelection
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 
-from util.ball_prediction_analysis import find_slice_at_time
 from util.boost_pad_tracker import BoostPadTracker
 from util.drive import steer_toward_target
+from util.orientation import Orientation, relative_location
 from util.sequence import Sequence, ControlStep
 from util.vec import Vec3
 
@@ -41,34 +43,62 @@ class MyBot(BaseAgent):
         car_location = Vec3(my_car.physics.location)
         car_velocity = Vec3(my_car.physics.velocity)
         ball_location = Vec3(packet.game_ball.physics.location)
+        ball_velocity = Vec3(packet.game_ball.physics.velocity)
+        car_orientation = Orientation(my_car.physics.rotation)
 
-        # By default we will chase the ball, but target_location can be changed later
-        target_location = ball_location
+        # Aim to carry the ball toward the opponent's goal by staying just behind it.
+        opponent_goal_y = 5120 if self.team == 0 else -5120
+        opponent_goal = Vec3(0, opponent_goal_y, 0)
+        direction_to_goal = (opponent_goal - ball_location).flat()
 
-        if car_location.dist(ball_location) > 1500:
-            # We're far away from the ball, let's try to lead it a little bit
-            ball_prediction = self.get_ball_prediction_struct()  # This can predict bounces, etc
-            ball_in_future = find_slice_at_time(ball_prediction, packet.game_info.seconds_elapsed + 2)
+        # Ensure we always have a direction to offset from, even if the ball is centered.
+        if direction_to_goal.length() < 1:
+            direction_to_goal = Vec3(0, 1 if opponent_goal_y > 0 else -1, 0)
 
-            # ball_in_future might be None if we don't have an adequate ball prediction right now, like during
-            # replays, so check it to avoid errors.
-            if ball_in_future is not None:
-                target_location = Vec3(ball_in_future.physics.location)
-                self.renderer.draw_line_3d(ball_location, target_location, self.renderer.cyan())
+        approach_offset = direction_to_goal.rescale(250)
+        target_location = ball_location - approach_offset
 
         # Draw some things to help understand what the bot is thinking
         self.renderer.draw_line_3d(car_location, target_location, self.renderer.white())
         self.renderer.draw_string_3d(car_location, 1, 1, f'Speed: {car_velocity.length():.1f}', self.renderer.white())
         self.renderer.draw_rect_3d(target_location, 8, 8, True, self.renderer.cyan(), centered=True)
+        self.renderer.draw_line_3d(ball_location, ball_location + Vec3(0, 0, 200), self.renderer.red())
 
-        if 750 < car_velocity.length() < 800:
-            # We'll do a front flip if the car is moving at a certain speed.
-            return self.begin_front_flip(packet)
+        relative_target = relative_location(car_location, car_orientation, target_location)
+        angle_to_target = math.atan2(relative_target.y, relative_target.x)
+        distance_to_ball = car_location.flat().dist(ball_location.flat())
 
         controls = SimpleControllerState()
         controls.steer = steer_toward_target(my_car, target_location)
-        controls.throttle = 1.0
-        # You can set more controls if you want, like controls.boost.
+
+        # Stay under the ball: slow down as we get close so it can settle on the roof.
+        if distance_to_ball > 2500:
+            controls.throttle = 1.0
+            controls.boost = abs(angle_to_target) < 0.3
+        elif distance_to_ball > 1200:
+            controls.throttle = 0.8
+            controls.boost = abs(angle_to_target) < 0.35 and distance_to_ball > 1500
+        else:
+            controls.throttle = 0.35
+
+        # Apply gentle steering help to stay aligned when making tight turns.
+        controls.handbrake = abs(angle_to_target) > 1.8 and car_velocity.length() < 900
+
+        # Nudge the ball up for a dribble when we're under it and it's low.
+        relative_ball = relative_location(car_location, car_orientation, ball_location)
+        low_and_centered = relative_ball.x > -30 and abs(relative_ball.y) < 150 and ball_location.z < 200
+        if my_car.has_wheel_contact and distance_to_ball < 180 and ball_location.z < 120:
+            controls.jump = True
+        elif low_and_centered:
+            controls.pitch = -0.15
+
+        # Match ball speed when carrying it to reduce losing control.
+        forward_speed = car_velocity.dot(car_orientation.forward)
+        desired_speed = max(600, min(ball_velocity.length() + 400, 1400))
+        speed_error = desired_speed - forward_speed
+        if distance_to_ball < 1000:
+            controls.throttle = max(min(speed_error / 1000, 0.75), -0.5)
+            controls.boost = False
 
         return controls
 
