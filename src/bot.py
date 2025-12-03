@@ -3,7 +3,7 @@ from rlbot.messages.flat.QuickChatSelection import QuickChatSelection
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 
 from util.ball_prediction_analysis import find_slice_at_time
-from util.boost_pad_tracker import BoostPad, BoostPadTracker
+from util.boost_pad_tracker import BoostPadTracker
 from util.drive import steer_toward_target
 from util.sequence import Sequence, ControlStep
 from util.vec import Vec3
@@ -42,10 +42,19 @@ class MyBot(BaseAgent):
         car_velocity = Vec3(my_car.physics.velocity)
         ball_location = Vec3(packet.game_ball.physics.location)
 
-        ball_prediction = self.get_ball_prediction_struct()
-        ball_in_future = find_slice_at_time(ball_prediction, packet.game_info.seconds_elapsed + 1.5)
+        # By default we will chase the ball, but target_location can be changed later
+        target_location = ball_location
 
-        target_location = self.choose_target(packet, car_location, ball_location, ball_in_future)
+        if car_location.dist(ball_location) > 1500:
+            # We're far away from the ball, let's try to lead it a little bit
+            ball_prediction = self.get_ball_prediction_struct()  # This can predict bounces, etc
+            ball_in_future = find_slice_at_time(ball_prediction, packet.game_info.seconds_elapsed + 2)
+
+            # ball_in_future might be None if we don't have an adequate ball prediction right now, like during
+            # replays, so check it to avoid errors.
+            if ball_in_future is not None:
+                target_location = Vec3(ball_in_future.physics.location)
+                self.renderer.draw_line_3d(ball_location, target_location, self.renderer.cyan())
 
         # Draw some things to help understand what the bot is thinking
         self.renderer.draw_line_3d(car_location, target_location, self.renderer.white())
@@ -59,7 +68,7 @@ class MyBot(BaseAgent):
         controls = SimpleControllerState()
         controls.steer = steer_toward_target(my_car, target_location)
         controls.throttle = 1.0
-        controls.boost = self.should_boost(my_car, target_location)
+        # You can set more controls if you want, like controls.boost.
 
         return controls
 
@@ -78,53 +87,3 @@ class MyBot(BaseAgent):
 
         # Return the controls associated with the beginning of the sequence so we can start right away.
         return self.active_sequence.tick(packet)
-
-    def choose_target(self, packet: GameTickPacket, car_location: Vec3, ball_location: Vec3, ball_in_future) -> Vec3:
-        """Decide where to drive next based on kickoff, boost needs, and defense."""
-
-        if self.is_kickoff(packet, ball_location):
-            return ball_location
-
-        my_car = packet.game_cars[self.index]
-        my_goal_y = -5120 if my_car.team == 0 else 5120
-        own_goal = Vec3(0, my_goal_y, 0)
-
-        # Try to grab a nearby full boost if we're starving and not right next to the ball
-        if my_car.boost < 25 and car_location.dist(ball_location) > 800:
-            boost_location = self.find_nearest_boost(car_location)
-            if boost_location is not None:
-                return boost_location
-
-        # Fall back to defending if the ball is dangerously close to our goal
-        if abs(ball_location.y - my_goal_y) < 1500 and ball_location.dist(car_location) > 500:
-            return own_goal
-
-        if ball_in_future is not None:
-            future_ball_location = Vec3(ball_in_future.physics.location)
-            self.renderer.draw_line_3d(ball_location, future_ball_location, self.renderer.cyan())
-            return future_ball_location
-
-        return ball_location
-
-    def is_kickoff(self, packet: GameTickPacket, ball_location: Vec3) -> bool:
-        ball_stationary = packet.game_ball.physics.velocity.x == 0 and packet.game_ball.physics.velocity.y == 0
-        return packet.game_info.is_round_active and ball_stationary and abs(ball_location.x) < 50 and abs(ball_location.y) < 50
-
-    def find_nearest_boost(self, car_location: Vec3) -> Vec3:
-        def pad_sort_key(pad: BoostPad):
-            return car_location.dist(pad.location)
-
-        active_pads = [pad for pad in self.boost_pad_tracker.get_full_boosts() if pad.is_active]
-        if not active_pads:
-            active_pads = [pad for pad in self.boost_pad_tracker.boost_pads if pad.is_active]
-
-        if not active_pads:
-            return None
-
-        return min(active_pads, key=pad_sort_key).location
-
-    def should_boost(self, my_car, target_location: Vec3) -> bool:
-        velocity = Vec3(my_car.physics.velocity)
-        needs_speed = velocity.length() < 2200 and my_car.boost > 0
-        facing_target = steer_toward_target(my_car, target_location) == 0
-        return needs_speed and facing_target
