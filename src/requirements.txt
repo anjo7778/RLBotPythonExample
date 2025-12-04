@@ -2,7 +2,9 @@
 # You will automatically get updates for all versions starting with "1.".
 rlbot==1.*
 --find-links https://download.pytorch.org/whl/torch_stable.html
-torch==1.9.1+cpu
+# Torch 1.9.1 wheels are no longer published for newer Python versions.
+# Pin to a recent CPU build that is available on PyPI to avoid installation errors.
+torch==2.2.2
 rlgym-compat>=1.1.0
 numpy
 
